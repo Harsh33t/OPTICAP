@@ -1,0 +1,34 @@
+[Unit]
+Description=OPTICap Sensory Intelligence System
+Documentation=https://github.com/overclocked-minds/opticap
+After=network.target sound.target
+Wants=sound.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/opticap/main_controller.py
+WorkingDirectory=/home/opticap
+User=pi
+Group=pi
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/home/opticap"
+
+# Restart policy — always restart on failure, 5-second delay
+Restart=always
+RestartSec=5
+
+# Resource limits (keep within 600MB RAM budget)
+MemoryMax=600M
+MemorySwapMax=0
+
+# Logging — redirect to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=opticap
+
+# Graceful shutdown timeout
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
