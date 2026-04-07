@@ -77,6 +77,20 @@ AI_PROMPT = (
     "The path ahead is clear, proceed straight.'"
 )
 
+OCR_PROMPT = """You are the OCR engine inside OPTICap, a wearable assistive cap for blind users in India. Your output is read aloud via text-to-speech.
+
+Rules:
+- Read ALL visible text in natural reading order, top to bottom
+- Speak numbers naturally: "50 rupees", "5 milligrams", "Gate 3"
+- If text is Hindi or Hinglish, read it and give the English meaning immediately after without announcing you are translating
+- Add ONE short context sentence at the end if helpful
+- Never start with "I can see", "I notice", or "The image shows"
+- No bullet points or markdown — plain flowing sentences only
+- Keep response under 60 words
+- If no text visible, say exactly: "No readable text in view."
+- If text is blurred or cut off, read what is visible and say "rest is unclear"
+"""
+
 PROVIDERS = {
     "together": {"base_url": "https://api.together.xyz/v1", "model": "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo", "display": "Together AI"},
     "github": {"base_url": "https://models.inference.ai.azure.com", "model": "Llama-3.2-11B-Vision-Instruct", "display": "GitHub"},
@@ -132,10 +146,11 @@ class GeminiWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit_frame(self, frame):
+    def submit_frame(self, frame, prompt_type="scene"):
         try:
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            self._in_q.put_nowait(buf.tobytes())
+            prompt_str = OCR_PROMPT if prompt_type == "ocr" else AI_PROMPT
+            self._in_q.put_nowait({"frame": buf.tobytes(), "type": prompt_type, "prompt": prompt_str})
         except: pass
 
     def get_result(self):
@@ -144,17 +159,21 @@ class GeminiWorker:
 
     def _run(self):
         while self._running:
-            try: jpg_bytes = self._in_q.get(timeout=1.0)
+            try:
+                task = self._in_q.get(timeout=1.0)
+                jpg_bytes = task["frame"]
+                prompt = task.get("prompt", AI_PROMPT)
+                req_type = task.get("type", "scene")
             except: continue
             try:
                 resp = self._model.generate_content(
-                    [AI_PROMPT, {"mime_type": "image/jpeg", "data": base64.b64encode(jpg_bytes).decode()}],
+                    [prompt, {"mime_type": "image/jpeg", "data": base64.b64encode(jpg_bytes).decode()}],
                     safety_settings={HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE}
                 )
-                res = resp.text.strip()
+                res = resp.text.strip().replace("*", "").replace("#", "")
             except Exception as e:
-                res = f"[Gemini Rate Limit: Pausing updates. Using YOLO.]" if "429" in str(e) else f"[Gemini Error: {e}]"
-            try: self._out_q.put_nowait(res)
+                res = f"[Gemini Limit Reached]" if "429" in str(e) else f"[Gemini Error]"
+            try: self._out_q.put_nowait({"type": req_type, "text": res})
             except: pass
 
     def stop(self): self._running = False
@@ -170,10 +189,11 @@ class OpenAIVisionWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit_frame(self, frame):
+    def submit_frame(self, frame, prompt_type="scene"):
         try:
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            self._in_q.put_nowait(buf.tobytes())
+            prompt_str = OCR_PROMPT if prompt_type == "ocr" else AI_PROMPT
+            self._in_q.put_nowait({"frame": buf.tobytes(), "type": prompt_type, "prompt": prompt_str})
         except: pass
 
     def get_result(self):
@@ -182,17 +202,22 @@ class OpenAIVisionWorker:
 
     def _run(self):
         while self._running:
-            try: jpg_bytes = self._in_q.get(timeout=1.0)
+            try:
+                task = self._in_q.get(timeout=1.0)
+                jpg_bytes = task["frame"]
+                prompt = task.get("prompt", AI_PROMPT)
+                req_type = task.get("type", "scene")
             except: continue
             try:
                 resp = self.client.chat.completions.create(
                     model=self.model,
-                    messages=[{"role": "user", "content": [{"type": "text", "text": AI_PROMPT}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(jpg_bytes).decode()}"}}]}]
+                    messages=[{"role": "system", "content": prompt}, {"role": "user", "content": [{"type": "text", "text": "Execute task."}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(jpg_bytes).decode()}"}}]}],
+                    temperature=0.1
                 )
-                res = resp.choices[0].message.content.strip()
+                res = resp.choices[0].message.content.strip().replace("*", "").replace("#", "")
             except Exception as e:
-                res = f"[{self.display_name} Limit Reached. Using YOLO.]" if "429" in str(e) else f"[{self.display_name} Error: {e}]"
-            try: self._out_q.put_nowait(res)
+                res = f"[{self.display_name} Limit Reached. Using YOLO.]" if ("429" in str(e) or "quota" in str(e).lower()) else f"[{self.display_name} Error: {e}]"
+            try: self._out_q.put_nowait({"type": req_type, "text": res})
             except: pass
 
     def stop(self): self._running = False
@@ -201,15 +226,16 @@ class OpenAIVisionWorker:
 # ─────────────────────────────────────────────────────────────────────────────
 # HUD & Main
 # ─────────────────────────────────────────────────────────────────────────────
-def draw_hud(frame, yolo_alerts, ai_text, fps, ai_name, ai_status):
+def draw_hud(frame, yolo_alerts, ai_text, fps, ai_name, ai_status, ocr_text=None, ocr_status="ready"):
     h, w = frame.shape[:2]
     filled_rounded_rect(frame, 0, 0, w, 52, C_DARK, alpha=0.85, r=0)
     put_text_shaded(frame, "OPTICap  LIVE DEMO", (14, 34), scale=0.85, color=(200,230,255), thickness=2, font=cv2.FONT_HERSHEY_DUPLEX)
     
     ai_col = (100,255,140) if ai_name else (100,100,120)
     disp_name = (ai_name.upper() if getattr(ai_name, "upper", None) else str(ai_name).upper()) if ai_name else "AI"
-    put_text_shaded(frame, f"FPS {fps:04.1f}   {disp_name}: {ai_status}", (w-400, 34), scale=0.52, color=ai_col)
+    put_text_shaded(frame, f"FPS {fps:04.1f}   {disp_name}: {ai_status}   OCR: {ocr_status}", (w-550, 34), scale=0.52, color=ai_col)
 
+    # ── AI Scene description panel ──
     if ai_text:
         lines = textwrap.wrap(ai_text, width=int(w / 8.5))[:4]
         py = 58
@@ -219,6 +245,17 @@ def draw_hud(frame, yolo_alerts, ai_text, fps, ai_name, ai_status):
         put_text_shaded(frame, disp_name, (12, py+17), scale=0.42, color=(220,255,220), thickness=1)
         for i, ln in enumerate(lines):
             put_text_shaded(frame, ln, (142, py+18+i*24), scale=0.52, color=(210,255,210), thickness=1)
+
+    # ── AI OCR Panel ──
+    if ocr_text:
+        lines = textwrap.wrap(ocr_text, width=int(w / 8.5))[:4]
+        py = 58 + 120 # Offset below Scene Description
+        filled_rounded_rect(frame, 0, py, w, py + len(lines)*24 + 18, (10,30,50), alpha=0.9, r=0)
+        cv2.line(frame, (0, py), (w, py), (60,100,200), 1)
+        cv2.rectangle(frame, (8, py+4), (135, py+22), (60,100,180), -1)
+        put_text_shaded(frame, f"OCR TEXT", (12, py+17), scale=0.42, color=(220,255,255), thickness=1)
+        for i, ln in enumerate(lines):
+            put_text_shaded(frame, ln, (142, py+18+i*24), scale=0.52, color=(210,230,255), thickness=1)
 
     if yolo_alerts:
         unique = []
@@ -270,6 +307,9 @@ def run_demo(camera_idx=0, video_path=None, api_key=None, provider="gemini"):
     ai_status = "ready"
     last_ai_req = 0.0
 
+    ocr_text = ""
+    ocr_status = "ready"
+
     while True:
         t0 = time.time()
         ret, frame = cap.read()
@@ -298,19 +338,37 @@ def run_demo(camera_idx=0, video_path=None, api_key=None, provider="gemini"):
                 yolo_alerts.append((tier, alert))
 
         if ai_worker and now - last_ai_req >= AI_INTERVAL:
-            ai_worker.submit_frame(cv2.resize(frame, (480, 360)))
+            ai_worker.submit_frame(cv2.resize(frame, (480, 360)), prompt_type="scene")
             last_ai_req, ai_status = now, "analyzing…"
 
         if ai_worker:
             res = ai_worker.get_result()
-            if res: ai_text, ai_status = res, "live"
+            if res: 
+                if res["type"] == "scene":
+                    ai_text, ai_status = res["text"], "live"
+                elif res["type"] == "ocr":
+                    ocr_text, ocr_status = res["text"], "live"
 
         draw_detections(frame, boxes_info)
         fps_buf.append(time.time() - t0)
-        draw_hud(frame, sorted(yolo_alerts, key=lambda x: x[0]), ai_text, 1.0/(sum(fps_buf)/len(fps_buf)) if fps_buf else 0, ai_name, ai_status)
+        draw_hud(frame, sorted(yolo_alerts, key=lambda x: x[0]), ai_text, 1.0/(sum(fps_buf)/len(fps_buf)) if fps_buf else 0, ai_name, ai_status, ocr_text, ocr_status)
 
-        cv2.imshow("OPTICap Live Demo [Q=quit]", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        cv2.imshow("OPTICap Live Demo [Q=quit, O=OCR]", frame)
+        k = cv2.waitKey(1) & 0xFF
+
+        if k in (ord('q'), 27):
+            break
+        elif k == ord('s'):
+            cv2.imwrite("opticap_shot.jpg", frame)
+            print("  📸 Screenshot saved")
+        elif k == ord('o'):
+            if ai_worker:
+                print("  👁️ Triggering OCR Read...")
+                ocr_text = ""
+                ocr_status = "reading..."
+                ai_worker.submit_frame(cv2.resize(frame, (640, 480)), prompt_type="ocr")
+            else:
+                print("  ✗ Cannot run OCR without API key. Add --key!")
 
     cap.release()
     cv2.destroyAllWindows()
