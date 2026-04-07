@@ -39,6 +39,7 @@ from audio_engine     import audio_engine
 from gesture_engine   import gesture_engine
 from ultrasonic_engine import ultrasonic_engine
 from button_handler   import button_handler
+from ocr_engine       import ocr_engine
 
 
 class OPTICap:
@@ -72,8 +73,9 @@ class OPTICap:
         pothole_detector.load_model()
         vision_engine.open_camera()
 
-        # 5. Face engine
+        # 5. Face & OCR engines
         face_engine.setup()
+        ocr_engine.setup()
 
         # 6. Audio engine
         audio_engine.load_model()
@@ -184,26 +186,16 @@ class OPTICap:
         self._read_frame_text()
 
     def _read_frame_text(self):
-        """OCR on current camera frame (Tesseract)."""
-        import subprocess, tempfile, cv2, numpy as np
+        """OCR on current camera frame using AI."""
         frame = vision_engine.get_frame()
         if frame is None:
             return
-        try:
-            import pytesseract
-            gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            text = pytesseract.image_to_string(thresh).strip()
-            if text:
-                alert_manager.speak(f"Text reads: {text}", priority=config.PRIORITY_LOW,
-                                    source="ocr")
-            else:
-                alert_manager.speak("No text detected", priority=config.PRIORITY_LOW,
-                                    source="ocr")
-        except ImportError:
-            alert_manager.speak("OCR not available", priority=config.PRIORITY_LOW,
-                                source="ocr")
+        
+        # Define callback to funnel OCR output straight into TTS
+        def _on_ocr_result(text):
+            alert_manager.speak(text, priority=config.PRIORITY_LOW, source="ocr")
+            
+        ocr_engine.read_frame_async(frame, _on_ocr_result)
 
     # ── Gesture Toggle ────────────────────────────────────────────────────
     def _on_gesture_toggle(self):

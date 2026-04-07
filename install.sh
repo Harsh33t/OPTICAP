@@ -59,6 +59,7 @@ pip3 install \
     pyzbar \
     scikit-learn \
     pytesseract \
+    openai \
     smbus2
 
 # Optional: ultralytics (only for model export, NOT for inference on Pi)
